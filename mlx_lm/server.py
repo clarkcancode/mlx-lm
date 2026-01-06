@@ -4,6 +4,7 @@ import argparse
 import copy
 import json
 import logging
+import re
 import platform
 import socket
 import time
@@ -306,6 +307,59 @@ class LRUPromptCache:
         if len(self._lru) > self.max_size:
             model, tokens = self._lru.popleft()
             self._delete(model, tokens)
+
+def _tokenizer_uses_harmony(tokenizer):
+    """
+    Detect if this tokenizer uses a GPT-OSS Harmony-style chat template.
+    Harmony templates use <|channel|> tags and expect 'thinking' fields
+    for analysis content.
+    """
+    try:
+        template = tokenizer.chat_template
+        if template and isinstance(template, str):
+            has_channel = "<|channel|>" in template
+            has_thinking = "thinking" in template
+            # Check for Harmony-specific markers
+            return has_channel and has_thinking
+        return False
+    except (AttributeError, TypeError) as e:
+        return False
+
+def _split_harmony_message(text):
+    """
+    Parse a Harmony-formatted response into analysis and final sections.
+    Expected format:
+        <|channel|>analysis<|message|>
+        ... thinking content ...
+        <|end|>
+        <|channel|>final<|message|>
+        ... final answer ...
+        <|end|>
+    Returns a tuple of (analysis_text, final_text).
+    The channel tags are stripped - only the content between <|message|> and <|end|> is kept.
+    Handles incomplete responses where the final <|end|> tag might be missing.
+    """
+    analysis_text = ""
+    final_text = ""
+
+    # Pattern to match analysis section (content between <|message|> and <|end|>)
+    analysis_pattern = r'<\|channel\|>analysis\s*<\|message\|>(.*?)<\|end\|>'
+    analysis_match = re.search(analysis_pattern, text, re.DOTALL)
+    if analysis_match:
+        analysis_text = analysis_match.group(1).strip()
+
+    # Pattern to match final section (content between <|message|> and optional <|end|>)
+    # Handle both complete responses (with <|end|>) and incomplete ones (without)
+    final_pattern = r'<\|channel\|>final\s*<\|message\|>(.*?)(?:<\|end\|>|$)'
+    final_match = re.search(final_pattern, text, re.DOTALL)
+    if final_match:
+        final_text = final_match.group(1).strip()
+
+    # If no sections found, assume the entire text is the final answer
+    if not analysis_text and not final_text:
+        final_text = text
+
+    return analysis_text, final_text
 
 
 @dataclass
@@ -1191,6 +1245,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     # Client disconnected, ignore
                     pass
+        convert_harmony = self.model_provider.cli_args.convert_harmony and _tokenizer_uses_harmony(self.tokenizer)
+        channel = "analysis" if convert_harmony else "final"
+        harmony_tag = None
 
         # Create the token generator
         try:
@@ -1288,7 +1345,25 @@ class APIHandler(BaseHTTPRequestHandler):
                     tool_text += gen.text
             else:
                 text += gen.text
-                segment += gen.text
+                if convert_harmony:
+                    matches = re.search(r'<\|(\w+)\|>', gen.text, re.DOTALL)
+                    if matches:
+                        harmony_tag = matches.group(1).strip()
+                    elif harmony_tag == 'channel':
+                        channel = gen.text
+                        if channel == "analysis":
+                            segment = "<think>"
+                        else:
+                            segment = "</think>"
+                        harmony_tag = None
+                    else:
+                        segment = gen.text
+                        harmony_tag = None
+                else:
+                    segment += gen.text
+
+            token = gen.token
+            self.prompt_cache.tokens.append(token)
 
             # Save the token and its logprob
             tokens.append(gen.token)
@@ -1346,6 +1421,17 @@ class APIHandler(BaseHTTPRequestHandler):
                 tool_calls=parse_tools(tool_calls),
                 reasoning_text=reasoning_text,
             )
+
+            if convert_harmony:
+                for choice in response['choices']:
+                    if 'message' in choice:
+                        analysis, final = _split_harmony_message(
+                            choice['message'].get('content', '')
+                        )
+                        if analysis:
+                            choice['message']['thinking'] = analysis
+                            choice['message']['content'] = final
+
             self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
             self.wfile.flush()
             if self.stream_options is not None and self.stream_options["include_usage"]:
@@ -1366,6 +1452,17 @@ class APIHandler(BaseHTTPRequestHandler):
                 reasoning_text=reasoning_text,
                 tool_calls=parse_tools(tool_calls),
             )
+
+            for choice in response['choices']:
+                if 'message' in choice:
+                    if convert_harmony:
+                        analysis, final = _split_harmony_message(
+                            choice['message'].get('content', '')
+                        )
+                        if analysis:
+                            choice['message']['thinking'] = analysis
+                            choice['message']['content'] = final
+
             response_json = json.dumps(response).encode()
             indent = "\t"  # Backslashes can't be inside of f-strings
             logging.debug(f"Outgoing Response: {json.dumps(response, indent=indent)}")
@@ -1644,6 +1741,11 @@ def main():
         type=json.loads,
         help="""A JSON formatted string of arguments for the tokenizer's apply_chat_template, e.g. '{"enable_thinking":false}'""",
         default="{}",
+    )
+    parser.add_argument(
+        "--convert-harmony",
+        action="store_true",
+        help="Convert Harmony special tokens in the output",
     )
     args = parser.parse_args()
     if mx.metal.is_available():
