@@ -27,6 +27,14 @@ pip install mlx-lm
 conda install -c conda-forge mlx-lm
 ```
 
+### Details of this fork
+This fork adds functionality to the server to convert harmony-formated output to <think> tags so that open webui can understand the response.
+
+Add the flag when starting the server to enable the conversion:
+``` uv run mlx_lm.server --convert-harmony```
+
+The harmony-specific code is currently based off [work by AndrewFasano](https://github.com/simonw/llm-mlx/pull/24), but I hope to use the [official harmony package](https://github.com/openai/harmony) eventually
+
 ### Quick Start
 
 To generate text with an LLM use:
