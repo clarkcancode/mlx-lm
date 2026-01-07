@@ -924,6 +924,9 @@ class ResponseGenerator:
     def cli_args(self):
         return self.model_provider.cli_args
 
+    @property
+    def convert_harmony(self):
+        return self.model_provider.cli_args.convert_harmony and _tokenizer_uses_harmony(self.model_provider.tokenizer)
 
 class APIHandler(BaseHTTPRequestHandler):
     def __init__(
@@ -1245,9 +1248,6 @@ class APIHandler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     # Client disconnected, ignore
                     pass
-        convert_harmony = self.model_provider.cli_args.convert_harmony and _tokenizer_uses_harmony(self.tokenizer)
-        channel = "analysis" if convert_harmony else "final"
-        harmony_tag = None
 
         # Create the token generator
         try:
@@ -1261,6 +1261,10 @@ class APIHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write((f"{e}").encode())
             return
+
+        convert_harmony = self.response_generator.convert_harmony
+        channel = "analysis" if convert_harmony else "final"
+        harmony_tag = None
 
         # Prepare the headers
         if self.stream:
@@ -1361,9 +1365,6 @@ class APIHandler(BaseHTTPRequestHandler):
                         harmony_tag = None
                 else:
                     segment += gen.text
-
-            token = gen.token
-            self.prompt_cache.tokens.append(token)
 
             # Save the token and its logprob
             tokens.append(gen.token)
