@@ -54,6 +54,12 @@ def setup_arg_parser():
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
+    parser.add_argument(
+        "--quantize-activations",
+        "-qa",
+        action="store_true",
+        help="Quantize activations using the same quantization config as the corresponding layer.",
+    )
     return parser
 
 
@@ -75,11 +81,14 @@ def main():
 
     if group.size() > 1:
         model, tokenizer, config = sharded_load(
-            args.model, pipeline_group, tensor_group, return_config=True
+            model_path, pipeline_group, tensor_group, return_config=True
         )
     else:
         model, tokenizer, config = load(
-            args.model, return_config=True, tokenizer_config={"trust_remote_code": True}
+            model_path,
+            return_config=True,
+            tokenizer_config={"trust_remote_code": True},
+            model_config={"quantize_activations": args.quantize_activations},
         )
 
     # Empty to avoid early stopping

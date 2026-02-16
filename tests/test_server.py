@@ -19,7 +19,7 @@ class DummyModelProvider:
         HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
         self.model, self.tokenizer = load(HF_MODEL_PATH)
         self.model_key = (HF_MODEL_PATH, None)
-        self.cache_types = set([KVCache])
+        self.is_batchable = True
 
         # Add draft model support
         self.draft_model = None
@@ -41,6 +41,8 @@ class DummyModelProvider:
                 "max_tokens": 512,
                 "chat_template_args": {},
                 "model": None,
+                "decode_concurrency": 32,
+                "prompt_concurrency": 8,
             },
         )
 

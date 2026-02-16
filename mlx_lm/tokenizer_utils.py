@@ -1,12 +1,11 @@
 import importlib
 import json
+import warnings
 from functools import partial
 from json import JSONDecodeError
 from typing import Any, Dict, List, Optional
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
-
-from .tool_parsers.json_tools import parse_tool_call as default_tool_parser
 
 
 class StreamingDetokenizer:
@@ -92,7 +91,11 @@ class NaiveStreamingDetokenizer(StreamingDetokenizer):
     def text(self):
         if self._current_tokens:
             self._current_text = self._tokenizer.decode(self._current_tokens)
-            if self._current_text.endswith("\ufffd"):
+            if self._current_text.endswith("\ufffd") or (
+                self._tokenizer.clean_up_tokenization_spaces
+                and len(self._current_text) > 0
+                and self._current_text[-1] == " "
+            ):
                 self._current_text = self._current_text[:-1]
         if self._current_text and self._current_text[-1] == "\n":
             self._text += self._current_text
@@ -160,6 +163,8 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
     _space_matches = (".", "?", "!", ",", "n't", "'m", "'s", "'ve", "'re")
 
     def __init__(self, tokenizer):
+        self.clean_spaces = tokenizer.clean_up_tokenization_spaces
+
         # Extract the tokens in a list from id to text
         self.tokenmap = [None] * len(tokenizer.vocab)
         for value, tokenid in tokenizer.vocab.items():
@@ -194,6 +199,8 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
             return current_text
         elif not self.text:
             return current_text[1:]
+        elif self.clean_spaces and current_text[1:].startswith(self._space_matches):
+            return current_text[1:]
         return current_text
 
     def add_token(self, token):
@@ -203,7 +210,10 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         text = self._decode_bytes(self._unflushed)
 
         # For multi-byte utf-8 wait until they are complete
-        if not text.endswith("\ufffd"):
+        # For single spaces wait until the next token to clean it if needed
+        if not text.endswith("\ufffd") and not (
+            len(v) == 1 and self._byte_decoder.get(v[0]) == 32
+        ):
             self.text += self._maybe_trim_space(text)
             self._unflushed = ""
 
@@ -276,12 +286,15 @@ class TokenizerWrapper:
         self.has_chat_template = (
             tokenizer.chat_template is not None or chat_template is not None
         )
-        self._tool_parser = tool_parser or default_tool_parser
+        self._tool_parser = tool_parser
         self._tool_call_start = tool_call_start
         self._tool_call_end = tool_call_end
 
         vocab = tokenizer.get_vocab()
-        THINK_TOKENS = [("<think>", "</think>")]
+        THINK_TOKENS = [
+            ("<think>", "</think>"),
+            ("<longcat_think>", "</longcat_think>"),
+        ]
         for think_start, think_end in THINK_TOKENS:
             if think_start in vocab and think_end in vocab:
                 self._think_start = think_start
@@ -290,11 +303,13 @@ class TokenizerWrapper:
                 self._think_end_id = vocab[think_end]
                 break
 
-        # Fallback to defaults if no tool call tokens are provided
-        if tool_call_start and tool_call_start not in vocab:
-            raise ValueError("Tool call start token not in vocab")
-        if tool_call_end and tool_call_end not in vocab:
-            raise ValueError("Tool call end token not in vocab")
+        # Disable tool calling if tool call tokens aren't in vocab
+        if (tool_call_start and tool_call_start not in vocab) or (
+            tool_call_end and tool_call_end not in vocab
+        ):
+            self._tool_call_start = None
+            self._tool_call_end = None
+            self._tool_parser = None
 
     def apply_chat_template(self, *args, tokenize=True, **kwargs):
         if self._chat_template is not None:
@@ -460,10 +475,21 @@ def _infer_tool_parser(chat_template):
         return "minimax_m2"
     elif "<start_function_call>" in chat_template:
         return "function_gemma"
+    elif "<longcat_tool_call>" in chat_template:
+        return "longcat"
     elif "<arg_key>" in chat_template:
         return "glm47"
-    elif "<tool_call>\n<function=" in chat_template:
+    elif "<|tool_list_start|>" in chat_template:
+        return "pythonic"
+    elif (
+        "<tool_call>\\n<function=" in chat_template
+        or "<tool_call>\n<function=" in chat_template
+    ):
         return "qwen3_coder"
+    elif "<|tool_calls_section_begin|>" in chat_template:
+        return "kimi_k2"
+    elif "[TOOL_CALLS]" in chat_template:
+        return "mistral"
     elif "<tool_call>" in chat_template and "tool_call.name" in chat_template:
         return "json_tools"
     return None

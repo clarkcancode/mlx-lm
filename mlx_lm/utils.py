@@ -47,6 +47,7 @@ MODEL_REMAPPING = {
     "llava": "mistral3",
     "phi-msft": "phixtral",
     "falcon_mamba": "mamba",
+    "joyai_llm_flash": "deepseek_v3",
     "kimi_k2": "deepseek_v3",
     "qwen2_5_vl": "qwen2_vl",
     "minimax_m2": "minimax",
@@ -303,16 +304,30 @@ def load_model(
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
     if not weight_files and strict:
-        logging.error(f"No safetensors found in {model_path}")
         raise FileNotFoundError(f"No safetensors found in {model_path}")
 
     weights = {}
     for wf in weight_files:
         weights.update(mx.load(wf))
 
-    model_class, model_args_class = get_model_classes(config=config)
+    if (model_file := config.get("model_file")) is not None:
+        spec = importlib.util.spec_from_file_location(
+            "custom_model",
+            model_path / model_file,
+        )
+        arch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(arch)
+        model_class, model_args_class = arch.Model, arch.ModelArgs
+    else:
+        model_class, model_args_class = get_model_classes(config=config)
+
+    if "quantization_config" not in config:
+        text_config = config.get("text_config", {})
+        if "quantization_config" in text_config:
+            config["quantization_config"] = text_config["quantization_config"]
 
     model_args = model_args_class.from_dict(config)
+
     model = model_class(model_args)
 
     if hasattr(model, "sanitize"):
@@ -362,12 +377,34 @@ def load_model(
             config["quantization_config"] = quantization
             _quantize(quantization)
 
+    if config.get("quantize_activations", False):
+
+        def _maybe_qq(m):
+            if isinstance(m, nn.QuantizedLinear):
+                if m.mode not in ("nvfp4", "mxfp8"):
+                    raise ValueError(
+                        "Mode ({m.mode}) does not support activation quantization"
+                    )
+                if m.get("bias", False):
+                    raise ValueError(
+                        "Linear layer with bias does not support activation quantization"
+                    )
+                out_dims, in_dims = m.weight.shape
+                in_dims *= 32 // m.bits
+                return nn.QQLinear(in_dims, out_dims, m.group_size, m.bits, m.mode)
+            else:
+                return m
+
+        leaves = tree_map(_maybe_qq, model.leaf_modules(), is_leaf=nn.Module.is_module)
+
+        model.update_modules(leaves)
+
+    model.eval()
     model.load_weights(list(weights.items()), strict=strict)
 
     if not lazy:
         mx.eval(model.parameters())
 
-    model.eval()
     return model, config
 
 

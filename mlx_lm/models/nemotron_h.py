@@ -7,13 +7,14 @@ from typing import Any, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import (
     BaseModelArgs,
     create_attention_mask,
     create_ssm_mask,
     scaled_dot_product_attention,
 )
-from .cache import KVCache, MambaCache
+from .cache import ArraysCache, KVCache
 from .ssm import ssm_update
 from .switch_layers import SwitchMLP
 
@@ -35,7 +36,6 @@ class ModelArgs(BaseModelArgs):
     ssm_state_size: int
     conv_kernel: int
     n_groups: int
-    time_step_limit: Tuple[float, float]
     mlp_bias: bool
     layer_norm_epsilon: float
     use_bias: bool
@@ -51,6 +51,17 @@ class ModelArgs(BaseModelArgs):
     num_experts_per_tok: Optional[int] = None
     norm_topk_prob: Optional[bool] = None
     routed_scaling_factor: Optional[float] = None
+    time_step_limit: Optional[Tuple[float, float]] = None
+    time_step_min: Optional[float] = None
+    time_step_max: Optional[float] = None
+
+    def __post_init__(self):
+        if (
+            self.time_step_limit is None
+            and self.time_step_min is not None
+            and self.time_step_max is not None
+        ):
+            self.time_step_limit = (self.time_step_min, self.time_step_max)
 
 
 class MambaRMSNormGated(nn.Module):
@@ -62,7 +73,7 @@ class MambaRMSNormGated(nn.Module):
 
     def __call__(self, x: mx.array, gate: mx.array = None) -> mx.array:
         if gate is not None:
-            x = x * nn.silu(gate)
+            x = swiglu(gate, x)
         x = mx.unflatten(x, axis=-1, shape=(-1, self.group_size))
         x = mx.fast.rms_norm(x, weight=None, eps=self.eps)
         return self.weight * x.flatten(-2)
@@ -111,9 +122,15 @@ class NemotronHMamba2Mixer(nn.Module):
             self.intermediate_size, self.hidden_size, bias=args.mamba_proj_bias
         )
 
-    def _apply_conv(
-        self, conv_input: mx.array, cache: Optional[MambaCache] = None
+    def _conv(
+        self,
+        conv_input: mx.array,
+        cache: Optional[ArraysCache],
+        mask: Optional[mx.array],
     ) -> mx.array:
+        if mask is not None:
+            conv_input = mx.where(mask[..., None], conv_input, 0)
+
         if cache is not None:
             if cache[0] is None:
                 conv_state = mx.zeros(
@@ -123,11 +140,19 @@ class NemotronHMamba2Mixer(nn.Module):
             else:
                 conv_state = cache[0]
             padded_input = mx.concatenate([conv_state, conv_input], axis=1)
-            cache[0] = padded_input[:, -(self.conv_kernel_size - 1) :, :]
+            n_keep = self.conv_kernel_size - 1
+            if cache.lengths is not None:
+                t = padded_input.shape[1]
+                ends = mx.clip(cache.lengths, 0, t - n_keep)
+                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+                cache[0] = mx.take_along_axis(padded_input, positions, axis=1)
+            else:
+                cache[0] = padded_input[:, -n_keep:, :]
         else:
             padded_input = mx.pad(
                 conv_input, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)]
             )
+
         conv_output = self.conv1d(padded_input)
         return nn.silu(conv_output)
 
@@ -137,8 +162,8 @@ class NemotronHMamba2Mixer(nn.Module):
         B: mx.array,
         C: mx.array,
         dt: mx.array,
-        state: Optional[mx.array],
-        mask: Optional[mx.array] = None,
+        cache: Optional[ArraysCache],
+        mask: Optional[mx.array],
     ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -147,6 +172,11 @@ class NemotronHMamba2Mixer(nn.Module):
         )
         B = B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
         C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
+        if cache:
+            state = cache[1]
+            lengths = cache.lengths
+        else:
+            state, lengths = None, None
 
         y, state = ssm_update(
             hidden_states,
@@ -160,14 +190,16 @@ class NemotronHMamba2Mixer(nn.Module):
             self.time_step_limit,
             mask,
         )
+        if cache:
+            cache[1] = state
 
-        return y.reshape(batch_size, seq_len, self.intermediate_size), state
+        return y.reshape(batch_size, seq_len, self.intermediate_size)
 
     def __call__(
         self,
         hidden_states: mx.array,
         mask: Optional[mx.array],
-        cache: Optional[MambaCache] = None,
+        cache: Optional[ArraysCache] = None,
     ) -> mx.array:
 
         projected = self.in_proj(hidden_states)
@@ -177,11 +209,7 @@ class NemotronHMamba2Mixer(nn.Module):
             [self.intermediate_size, self.intermediate_size + self.conv_dim],
             axis=-1,
         )
-        if mask is not None:
-            conv_input = mx.where(mask[..., None], conv_input, 0)
-
-        conv_output = self._apply_conv(conv_input, cache)
-
+        conv_output = self._conv(conv_input, cache, mask)
         hidden_states_ssm, B, C = mx.split(
             conv_output,
             [
@@ -190,10 +218,9 @@ class NemotronHMamba2Mixer(nn.Module):
             ],
             axis=-1,
         )
-        state = cache[1] if cache else None
-        y, state = self._ssm(hidden_states_ssm, B, C, dt, state, mask)
+        y = self._ssm(hidden_states_ssm, B, C, dt, cache, mask)
         if cache:
-            cache[1] = state
+            cache.advance(y.shape[1])
         y = self.norm(y, gate)
         return self.out_proj(y)
 
@@ -468,7 +495,7 @@ class Model(nn.Module):
         caches = []
         for l in self.layers:
             if l.block_type == "M":
-                caches.append(MambaCache())
+                caches.append(ArraysCache(size=2))
             elif l.block_type == "*":
                 caches.append(KVCache())
         return caches

@@ -10,7 +10,7 @@ sys.path.append(str(package_dir))
 
 from _version import __version__
 
-MIN_MLX_VERSION = "0.29.2"
+MIN_MLX_VERSION = "0.30.4"
 
 setup(
     name="mlx-lm",
@@ -26,7 +26,7 @@ setup(
     install_requires=[
         f"mlx>={MIN_MLX_VERSION}; platform_system == 'Darwin'",
         "numpy",
-        "transformers==5.0.0rc1",
+        "transformers>=5.0.0",
         "sentencepiece",
         "protobuf",
         "pyyaml",
@@ -45,11 +45,13 @@ setup(
         "test": ["datasets", "lm-eval"],
         "train": ["datasets", "tqdm"],
         "evaluate": ["lm-eval", "tqdm"],
-        "cuda": [f"mlx[cuda]>={MIN_MLX_VERSION}"],
+        "cuda13": [f"mlx[cuda13]>={MIN_MLX_VERSION}"],
+        "cuda12": [f"mlx[cuda12]>={MIN_MLX_VERSION}"],
         "cpu": [f"mlx[cpu]>={MIN_MLX_VERSION}"],
     },
     entry_points={
         "console_scripts": [
+            "mlx_lm = mlx_lm.cli:main",
             "mlx_lm.awq = mlx_lm.quant.awq:main",
             "mlx_lm.dwq = mlx_lm.quant.dwq:main",
             "mlx_lm.dynamic_quant = mlx_lm.quant.dynamic_quant:main",
@@ -64,6 +66,7 @@ setup(
             "mlx_lm.lora = mlx_lm.lora:main",
             "mlx_lm.perplexity = mlx_lm.perplexity:main",
             "mlx_lm.server = mlx_lm.server:main",
+            "mlx_lm.share = mlx_lm.share:main",
             "mlx_lm.manage = mlx_lm.manage:main",
             "mlx_lm.upload = mlx_lm.upload:main",
         ]

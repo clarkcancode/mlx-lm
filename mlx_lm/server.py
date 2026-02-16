@@ -4,8 +4,9 @@ import argparse
 import copy
 import json
 import logging
-import re
+import pickle
 import platform
+import re
 import socket
 import time
 import uuid
@@ -16,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
-from threading import Condition, Lock, Thread
+from threading import Thread
 from typing import (
     Any,
     Callable,
@@ -34,20 +35,18 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
-from .generate import BatchGenerator, stream_generate
+from .generate import BatchGenerator, generation_stream, stream_generate
 from .models.cache import (
-    KVCache,
-    RotatingKVCache,
     can_trim_prompt_cache,
     make_prompt_cache,
     trim_prompt_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
-from .utils import load
+from .utils import load, sharded_load
 
 
 def get_system_fingerprint():
-    gpu_arch = mx.metal.device_info()["architecture"] if mx.metal.is_available() else ""
+    gpu_arch = mx.device_info()["architecture"]
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
 
 
@@ -155,7 +154,7 @@ def process_message_content(messages):
 
     """
     for message in messages:
-        content = message["content"]
+        content = message.get("content", None)
         if isinstance(content, list):
             text_fragments = [
                 fragment["text"] for fragment in content if fragment["type"] == "text"
@@ -396,8 +395,10 @@ class GenerationArguments:
 
     max_tokens: int
     num_draft_tokens: int
-    logprobs: int
+    logprobs: bool
+    top_logprobs: int
     seed: Optional[int]
+    chat_template_kwargs: Optional[Dict[str, Any]]
 
 
 @dataclass
@@ -437,7 +438,47 @@ class Response:
     token: int
     logprob: float
     finish_reason: Optional[str]
-    top_tokens: Optional[Tuple[int, float]]
+    top_tokens: Tuple[Dict[str, Any]]
+
+
+class TimeBudget:
+    def __init__(self, budget=0.5, iterations=25, sync_frequency=10):
+        self._is_distributed = mx.distributed.init().size() > 1
+        self._budget = budget
+        self._iterations = iterations
+        self._sync_frequency = sync_frequency
+
+        self._start = None
+        self._current_iterations = None
+        self._loops = 0
+        self._time_spent = 0
+
+    def __iter__(self):
+        self._start = time.time()
+        self._current_iterations = 0
+        return self
+
+    def __next__(self):
+        if not self._is_distributed:
+            if time.time() - self._start > self._budget:
+                raise StopIteration()
+            return None
+
+        self._current_iterations += 1
+        if self._current_iterations > self._iterations:
+            self._loops += 1
+            self._time_spent += time.time() - self._start
+            if self._loops % self._sync_frequency == 0:
+                with mx.stream(generation_stream):
+                    loop_time = mx.distributed.all_sum(self._time_spent).item()
+                avg_loop_time = loop_time / (
+                    mx.distributed.init().size() * self._sync_frequency
+                )
+                factor = self._budget / avg_loop_time
+                self._iterations = max(round(self._iterations * factor), 1)
+                self._loops = 0
+                self._time_spent = 0
+            raise StopIteration()
 
 
 class ModelProvider:
@@ -448,7 +489,14 @@ class ModelProvider:
         self.model = None
         self.tokenizer = None
         self.draft_model = None
-        self.cache_types = set()
+        self.is_batchable = False
+
+        group = mx.distributed.init()
+        self.pipeline_group = group if group.size() > 1 and cli_args.pipeline else None
+        self.tensor_group = (
+            group if group.size() > 1 and not cli_args.pipeline else None
+        )
+        self.is_distributed = group.size() > 1
 
         # Preload the default model if it is provided
         self.default_model_map = {}
@@ -482,15 +530,29 @@ class ModelProvider:
                     "argument or in the HTTP request"
                 )
             adapter_path = adapter_path or self.cli_args.adapter_path
-            model, tokenizer = load(
-                self.cli_args.model,
-                adapter_path=adapter_path,
-                tokenizer_config=tokenizer_config,
-            )
+            # TODO: Generalize distributed load
+            if self.is_distributed:
+                model, tokenizer = sharded_load(
+                    self.cli_args.model, self.pipeline_group, self.tensor_group
+                )
+            else:
+                model, tokenizer = load(
+                    self.cli_args.model,
+                    adapter_path=adapter_path,
+                    tokenizer_config=tokenizer_config,
+                )
         else:
-            model, tokenizer = load(
-                model_path, adapter_path=adapter_path, tokenizer_config=tokenizer_config
-            )
+            # TODO: Generalize distributed load
+            if self.is_distributed:
+                model, tokenizer = sharded_load(
+                    model_path, self.pipeline_group, self.tensor_group
+                )
+            else:
+                model, tokenizer = load(
+                    model_path,
+                    adapter_path=adapter_path,
+                    tokenizer_config=tokenizer_config,
+                )
 
         if self.cli_args.use_default_chat_template:
             if tokenizer.chat_template is None:
@@ -520,13 +582,10 @@ class ModelProvider:
             self.draft_model, draft_tokenizer = load(draft_model_path)
             validate_draft_tokenizer(draft_tokenizer)
 
-        # Figure out the cache types and save them in a set for anybody that
-        # wants to make a decision based on those.
-        for c in make_prompt_cache(self.model):
-            self.cache_types.add(type(c))
-        if self.draft_model is not None:
-            for c in make_prompt_cache(self.draft_model):
-                self.cache_types.add(type(c))
+        if self.draft_model is None:
+            self.is_batchable = all(
+                hasattr(c, "merge") for c in make_prompt_cache(self.model)
+            )
 
         return self.model, self.tokenizer
 
@@ -554,12 +613,29 @@ def _make_logits_processors(args):
     )
 
 
+def _format_top_logprobs(logprobs, top_logprobs, tokenizer) -> Tuple[Dict[str, Any]]:
+    """Returns info dicts for the top `top_logprobs` tokens from `logprobs`"""
+    if top_logprobs <= 0:
+        return ()
+    sorted_indices = mx.argpartition(-logprobs, kth=top_logprobs - 1)
+    top_indices = sorted_indices[:top_logprobs].tolist()
+    top_logprobs = logprobs[top_indices].tolist()
+    txts = tokenizer.convert_ids_to_tokens(top_indices)
+    return tuple(
+        {"id": i, "token": s, "logprob": g}
+        for i, s, g in zip(top_indices, txts, top_logprobs)
+    )
+
+
 class ResponseGenerator:
     def __init__(self, model_provider: ModelProvider, prompt_cache: LRUPromptCache):
         self.model_provider = model_provider
         self.prompt_cache = prompt_cache
         self.requests = Queue()
 
+        self._time_budget = TimeBudget()
+        self._is_distributed = mx.distributed.init().size() > 1
+        self._rank = mx.distributed.init().rank()
         self._stop = False
         self._generation_thread = Thread(target=self._generate)
         self._generation_thread.start()
@@ -568,7 +644,58 @@ class ResponseGenerator:
         self._stop = True
         self._generation_thread.join()
 
-    def _tokenize(self, tokenizer, request):
+    def join(self):
+        self._generation_thread.join()
+
+    def _next_request(self, timeout=None):
+        request = None
+        if not self._is_distributed or self._rank == 0:
+            try:
+                if timeout is not None:
+                    request = self.requests.get(timeout=timeout)
+                else:
+                    request = self.requests.get_nowait()
+            except QueueEmpty:
+                pass
+
+        return self._share_request(request)
+
+    def _share_object(self, obj):
+        if not self._is_distributed:
+            return obj
+
+        with mx.stream(generation_stream):
+            if self._rank == 0:
+                if obj is None:
+                    mx.eval(mx.distributed.all_sum(0))
+                    return None
+                else:
+                    data = mx.array(pickle.dumps(obj))
+                    mx.eval(mx.distributed.all_sum(data.size))
+                    mx.eval(mx.distributed.all_sum(data))
+                    return obj
+            else:
+                size = mx.distributed.all_sum(0).item()
+                if size == 0:
+                    return None
+                else:
+                    data = mx.zeros(size, dtype=mx.uint8)
+                    data = mx.distributed.all_sum(data)
+                    return pickle.loads(data)
+
+    def _share_request(self, request):
+        if not self._is_distributed:
+            return request
+
+        shareable = request[1:] if request is not None else None
+        shareable = self._share_object(shareable)
+        if shareable is None:
+            return None
+
+        rq = request[0] if request is not None else Queue()
+        return rq, *shareable
+
+    def _tokenize(self, tokenizer, request, args):
         if request.request_type == "chat":
             messages = request.messages
             tools = request.tools
@@ -576,12 +703,23 @@ class ResponseGenerator:
 
             if tokenizer.has_chat_template:
                 process_message_content(messages)
+                if tools and not tokenizer.has_tool_calling:
+                    logging.warning(
+                        "Received tools but model does not support tool calling. "
+                        "If you think this is an error, file an issue here: "
+                        "https://github.com/ml-explore/mlx-lm/issues"
+                    )
+
+                chat_template_args = self.model_provider.cli_args.chat_template_args
+                if args.chat_template_kwargs:
+                    chat_template_args = chat_template_args.copy()
+                    chat_template_args.update(args.chat_template_kwargs)
                 return tokenizer.apply_chat_template(
                     messages,
-                    tools,
+                    tools=tools,
                     add_generation_prompt=True,
                     tokenize=True,
-                    **self.model_provider.cli_args.chat_template_args,
+                    **chat_template_args,
                 )
             else:
                 return tokenizer.encode(convert_chat(messages, role_mapping))
@@ -589,14 +727,8 @@ class ResponseGenerator:
             return tokenizer.encode(request.prompt)
 
     def _is_batchable(self, args):
-        if (
-            args.model.draft != "default_model"
-            or self.model_provider.cli_args.draft_model is not None
-        ):
+        if not self.model_provider.is_batchable:
             return False
-        for c in self.model_provider.cache_types:
-            if c not in (KVCache, RotatingKVCache):
-                return False
         if args.seed is not None:
             return False
 
@@ -617,18 +749,16 @@ class ResponseGenerator:
             if unprocessed_requests:
                 return unprocessed_requests.pop()
             else:
-                try:
-                    if timeout is not None:
-                        return self.requests.get(timeout=timeout)
-                    else:
-                        return self.requests.get_nowait()
-                except QueueEmpty:
-                    return None
+                return self._next_request(timeout)
 
         def progress_callback(info):
             for uid, processed, total in info:
                 if uid in batch_results:
                     batch_results[uid]["rqueue"].put((min(processed, total), total))
+
+        if self._is_distributed:
+            seed = mx.distributed.all_sum(mx.random.state[0]).view(mx.uint64).item()
+            mx.random.seed(seed)
 
         while not self._stop:
             request = None
@@ -644,15 +774,18 @@ class ResponseGenerator:
             if request is not None:
                 rqueue, request, args = request
 
-                is_batchable = self._is_batchable(args)
-
                 # Can it be added to the current batch?
                 if (
                     batch_generator is not None
                     and current_model == args.model
-                    and is_batchable
+                    and self._is_batchable(args)
                 ):
-                    prompt = self._tokenize(current_tokenizer, request)
+                    try:
+                        prompt = self._tokenize(current_tokenizer, request, args)
+                    except Exception as e:
+                        rqueue.put(e)
+                        continue
+
                     ctx = GenerationContext(
                         has_tool_calling=tokenizer.has_tool_calling,
                         tool_call_start=tokenizer.tool_call_start,
@@ -692,13 +825,9 @@ class ResponseGenerator:
                     }
                     continue
 
-                # We have no batch and it actually is not a batchable request
-                # so serve single sequence at a time.
-                elif batch_generator is None and not is_batchable:
-                    self._serve_single((rqueue, request, args))
-                    continue
-
-                # No batch so make one and serve this batched
+                # No batch generator. Load the model and if it's not
+                # batchable serve sequential, o/w make a batch generaotr and
+                # serve batched
                 elif batch_generator is None:
                     try:
                         model, tokenizer = self.model_provider.load(
@@ -708,6 +837,10 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
+                    if not self._is_batchable(args):
+                        self._serve_single((rqueue, request, args))
+                        continue
+
                     current_model = args.model
                     current_tokenizer = tokenizer
                     current_model_key = self.model_provider.model_key
@@ -715,6 +848,8 @@ class ResponseGenerator:
                     batch_generator = BatchGenerator(
                         model,
                         stop_tokens=tokenizer.eos_token_ids,
+                        completion_batch_size=self.cli_args.decode_concurrency,
+                        prefill_batch_size=self.cli_args.prompt_concurrency,
                         prompt_progress_callback=progress_callback,
                     )
                     unprocessed_requests.append((rqueue, request, args))
@@ -741,12 +876,7 @@ class ResponseGenerator:
                     continue
 
                 uids_to_remove = []
-                time_budget = 0.5
-                start = time.time()
-                while True:
-                    if time.time() - start > time_budget:
-                        break
-
+                for _ in self._time_budget:
                     responses = batch_generator.next()
                     if not responses:
                         break
@@ -757,24 +887,15 @@ class ResponseGenerator:
                         if r.finish_reason != "stop":
                             result["detokenizer"].add_token(r.token)
 
-                        top_tokens = None
-                        if args.logprobs > 0:
-                            sorted_indices = mx.argpartition(
-                                -gen.logprobs, kth=args.logprobs - 1
-                            )
-                            top_indices = sorted_indices[: args.logprobs]
-                            top_logprobs = gen.logprobs[top_indices]
-                            top_token_info = zip(
-                                top_indices.tolist(), top_logprobs.tolist()
-                            )
-                            top_tokens = tuple(top_token_info)
                         result["rqueue"].put(
                             Response(
                                 result["detokenizer"].last_segment,
                                 r.token,
                                 r.logprobs[r.token].item(),
                                 r.finish_reason,
-                                top_tokens,
+                                _format_top_logprobs(
+                                    r.logprobs, args.top_logprobs, current_tokenizer
+                                ),
                             )
                         )
 
@@ -788,8 +909,20 @@ class ResponseGenerator:
                         if result["ctx"]._should_stop:
                             uids_to_remove.append(r.uid)
 
-                    if uids_to_remove:
-                        batch_generator.remove(uids_to_remove)
+                uids_to_remove = self._share_object(uids_to_remove)
+                if uids_to_remove:
+                    with mx.stream(generation_stream):
+                        caches = batch_generator.remove(
+                            uids_to_remove, return_prompt_caches=True
+                        )
+                        for uid, prompt_cache in caches.items():
+                            if uid not in batch_results:
+                                continue
+                            result = batch_results[uid]
+                            self.prompt_cache.insert_cache(
+                                current_model_key, result["cache_key"], prompt_cache
+                            )
+                            del batch_results[uid]
 
     def _serve_single(self, request):
         rqueue, request, args = request
@@ -800,13 +933,12 @@ class ResponseGenerator:
 
         try:
             # Load the model and tokenizer
-            model, tokenizer = self.model_provider.load(
-                args.model.model, args.model.adapter, args.model.draft
-            )
+            model = self.model_provider.model
+            tokenizer = self.model_provider.tokenizer
             draft_model = self.model_provider.draft_model
 
             # Prepare the prompt
-            prompt = self._tokenize(tokenizer, request)
+            prompt = self._tokenize(tokenizer, request, args)
 
             # Start the generation context
             ctx = GenerationContext(
@@ -858,28 +990,22 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
             ):
-                top_tokens = None
-                if args.logprobs > 0:
-                    sorted_indices = mx.argpartition(
-                        -gen.logprobs, kth=args.logprobs - 1
-                    )
-                    top_indices = sorted_indices[: args.logprobs]
-                    top_logprobs = gen.logprobs[top_indices]
-                    top_token_info = zip(top_indices.tolist(), top_logprobs.tolist())
-                    top_tokens = tuple(top_token_info)
-
                 rqueue.put(
                     Response(
                         gen.text,
                         gen.token,
                         gen.logprobs[gen.token].item(),
                         gen.finish_reason,
-                        top_tokens,
+                        _format_top_logprobs(
+                            gen.logprobs, args.top_logprobs, tokenizer
+                        ),
                     )
                 )
                 cache_key.append(gen.token)
 
                 if ctx._should_stop:
+                    if self._is_distributed:
+                        raise NotImplementedError()
                     break
 
             rqueue.put(None)
@@ -988,6 +1114,7 @@ class APIHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError as e:
             logging.error(f"JSONDecodeError: {e} - Raw body: {raw_body.decode()}")
             self._set_completion_headers(400)
+            self.end_headers()
             self.wfile.write(
                 json.dumps({"error": f"Invalid JSON in request body: {e}"}).encode()
             )
@@ -1024,8 +1151,10 @@ class APIHandler(BaseHTTPRequestHandler):
         self.xtc_probability = self.body.get("xtc_probability", 0.0)
         self.xtc_threshold = self.body.get("xtc_threshold", 0.0)
         self.logit_bias = self.body.get("logit_bias", None)
-        self.logprobs = self.body.get("logprobs", -1)
+        self.logprobs = self.body.get("logprobs", False)
+        self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
+        self.chat_template_kwargs = self.body.get("chat_template_kwargs")
         self.validate_model_parameters()
 
         # Get stop sequences
@@ -1068,9 +1197,12 @@ class APIHandler(BaseHTTPRequestHandler):
         ):
             raise ValueError("repetition_penalty must be a non-negative float")
 
-        if self.logprobs != -1 and not (0 < self.logprobs <= 10):
+        if not isinstance(self.logprobs, bool):
+            raise ValueError("logprobs must be a boolean")
+
+        if self.top_logprobs != -1 and not (0 < self.top_logprobs <= 10):
             raise ValueError(
-                f"logprobs must be between 1 and 10 but got {self.logprobs:,}"
+                f"top_logprobs must be between 1 and 10 but got {self.top_logprobs:,}"
             )
 
         if (
@@ -1110,7 +1242,7 @@ class APIHandler(BaseHTTPRequestHandler):
         prompt_token_count: Optional[int] = None,
         completion_token_count: Optional[int] = None,
         token_logprobs: Optional[List[float]] = None,
-        top_tokens: Optional[List[Dict[int, float]]] = None,
+        top_tokens: Optional[List[Tuple[Dict[str, Any]]]] = None,
         tokens: Optional[List[int]] = None,
         tool_calls: Optional[List[str]] = None,
         reasoning_text: Optional[str] = None,
@@ -1129,8 +1261,8 @@ class APIHandler(BaseHTTPRequestHandler):
               response, used to populate the "usage" field (not used when stream).
             token_logprobs (Optional[List[float]]): The log probabilities per token,
               in token order.
-            top_tokens (Optional[List[Dict[int, float]]]): List of dictionaries mapping
-              tokens to logprobs for the top N tokens at each token position.
+            top_tokens (Optional[List[Tuple[Dict[str, Any]]]]): List of outputs from
+              _format_top_logprobs, giving info on the top N tokens at each token position.
             tokens (Optional[List[int]]): List of tokens to return with logprobs structure
             tool_calls (Optional[List[str]]): List of tool calls.
             reasoning_text (Optional[str]): The reasoning text generated by the model.
@@ -1158,11 +1290,17 @@ class APIHandler(BaseHTTPRequestHandler):
             ],
         }
 
-        if token_logprobs or top_logprobs or tokens:
+        if top_logprobs:
             response["choices"][0]["logprobs"] = {
-                "token_logprobs": token_logprobs,
-                "top_logprobs": top_logprobs,
-                "tokens": tokens,
+                "content": [
+                    dict(i[0], top_logprobs=i) if i else {} for i in top_logprobs
+                ]
+            }
+        elif token_logprobs:
+            response["choices"][0]["logprobs"] = {
+                "content": [
+                    dict(id=i, logprob=g) for i, g in zip(tokens, token_logprobs)
+                ]
             }
 
         if not self.stream:
@@ -1230,7 +1368,9 @@ class APIHandler(BaseHTTPRequestHandler):
             max_tokens=self.max_tokens,
             num_draft_tokens=self.num_draft_tokens,
             logprobs=self.logprobs,
+            top_logprobs=self.top_logprobs,
             seed=self.seed,
+            chat_template_kwargs=self.chat_template_kwargs,
         )
 
         # Create keepalive callback to send SSE comments during long prompt processing
@@ -1259,7 +1399,7 @@ class APIHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._set_completion_headers(404)
             self.end_headers()
-            self.wfile.write((f"{e}").encode())
+            self.wfile.write(json.dumps({"error": f"{e}"}).encode())
             return
 
         convert_harmony = self.response_generator.convert_harmony
@@ -1283,16 +1423,16 @@ class APIHandler(BaseHTTPRequestHandler):
         tool_text = ""
         tool_idx = 0
 
-        def parse_single_tool(tool_text):
+        def format_tool_call(tool_call):
             nonlocal tool_idx
-            tool_call = ctx.tool_parser(tool_text, request.tools)
+            tool_call_id = tool_call.pop("id", None) or str(uuid.uuid4())
             tool_call["arguments"] = json.dumps(
                 tool_call["arguments"], ensure_ascii=False
             )
             out = {
                 "function": tool_call,
                 "type": "function",
-                "id": str(uuid.uuid4()),
+                "id": tool_call_id,
             }
             if self.stream:
                 out["index"] = tool_idx
@@ -1302,7 +1442,14 @@ class APIHandler(BaseHTTPRequestHandler):
         def parse_tools(tool_calls):
             if not tool_calls:
                 return []
-            return [parse_single_tool(tool_text) for tool_text in tool_calls]
+            result = []
+            for tool_text in tool_calls:
+                parsed = ctx.tool_parser(tool_text, request.tools)
+                if isinstance(parsed, list):
+                    result.extend(format_tool_call(tc) for tc in parsed)
+                else:
+                    result.append(format_tool_call(parsed))
+            return result
 
         # Start out in reasoning if the model is a reasoning model and the
         # prompt has an open think token but no closing think token
@@ -1368,10 +1515,11 @@ class APIHandler(BaseHTTPRequestHandler):
 
             # Save the token and its logprob
             tokens.append(gen.token)
-            token_logprobs.append(gen.logprob)
+            if args.logprobs:
+                token_logprobs.append(gen.logprob)
 
             # If requested save the k top logprobs
-            if gen.top_tokens is not None:
+            if args.top_logprobs > 0:
                 top_tokens.append(gen.top_tokens)
 
             # Check if we should stop early
@@ -1382,7 +1530,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 stop_words,
             )
             if stop_condition.stop_met:
-                finish_reason = "tool_call" if made_tool_call else "stop"
+                finish_reason = "tool_calls" if made_tool_call else "stop"
                 ctx.stop()
                 tokens = tokens[: len(tokens) - stop_condition.trim_length]
                 text = text[: len(text) - stop_condition.trim_text_length]
@@ -1414,6 +1562,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
             if gen.finish_reason is not None:
                 finish_reason = gen.finish_reason
+
+        # Flush any remaining tool text (e.g. when tool_call_end is empty)
+        if in_tool_call and tool_text:
+            tool_calls.append(tool_text)
 
         if self.stream:
             response = self.generate_response(
@@ -1617,15 +1769,14 @@ class APIHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
-def run(
+def _run_http_server(
     host: str,
     port: int,
-    model_provider: ModelProvider,
+    response_generator,
     server_class=ThreadingHTTPServer,
     handler_class=APIHandler,
 ):
     server_address = (host, port)
-    response_generator = ResponseGenerator(model_provider, LRUPromptCache())
     infos = socket.getaddrinfo(
         *server_address, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
     )
@@ -1644,7 +1795,26 @@ def run(
         "it only implements basic security checks."
     )
     logging.info(f"Starting httpd at {host} on port {port}...")
-    httpd.serve_forever()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        httpd.shutdown()
+        response_generator.stop_and_join()
+
+
+def run(
+    host: str,
+    port: int,
+    model_provider: ModelProvider,
+    server_class=ThreadingHTTPServer,
+    handler_class=APIHandler,
+):
+    group = mx.distributed.init()
+    response_generator = ResponseGenerator(model_provider, LRUPromptCache())
+    if group.rank() == 0:
+        _run_http_server(host, port, response_generator)
+    else:
+        response_generator.join()
 
 
 def main():
@@ -1744,13 +1914,30 @@ def main():
         default="{}",
     )
     parser.add_argument(
+        "--decode-concurrency",
+        type=int,
+        default=32,
+        help="When a request is batchable then decode that many requests in parallel",
+    )
+    parser.add_argument(
+        "--prompt-concurrency",
+        type=int,
+        default=8,
+        help="When a request is batchable then process that many prompts in parallel",
+    )
+    parser.add_argument(
+        "--pipeline",
+        action="store_true",
+        help="Use pipelining instead of tensor parallelism",
+    )
+    parser.add_argument(
         "--convert-harmony",
         action="store_true",
         help="Convert Harmony special tokens in the output",
     )
     args = parser.parse_args()
     if mx.metal.is_available():
-        wired_limit = mx.metal.device_info()["max_recommended_working_set_size"]
+        wired_limit = mx.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(wired_limit)
 
     logging.basicConfig(
